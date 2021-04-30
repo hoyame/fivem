@@ -3,6 +3,7 @@
 
 #include <gameSkeleton.h>
 
+#include <jitasm.h>
 #include <Hooking.h>
 
 #include <sysAllocator.h>
@@ -29,6 +30,8 @@
 #include <audDspEffect.h>
 
 #include <GameAudioState.h>
+
+#include <CL2LaunchMode.h>
 
 static concurrency::concurrent_queue<std::function<void()>> g_mainQueue;
 
@@ -285,6 +288,9 @@ namespace rage
 			}
 		}
 
+		int GetCustomMode();
+		void SetCustomMode(int idx);
+
 	private:
 		void* m_data; // +0
 		uint32_t m_size; // +8
@@ -326,6 +332,22 @@ namespace rage
 		}
 
 		DeleteCriticalSection(&m_lock);
+	}
+
+	int audReferencedRingBuffer::GetCustomMode()
+	{
+		if (m_pad_f1C == 0xBEEFCA3E)
+		{
+			return *(int*)&m_pad_f4A[0];
+		}
+
+		return -1;
+	}
+
+	void audReferencedRingBuffer::SetCustomMode(int idx)
+	{
+		m_pad_f1C = 0xBEEFCA3E;
+		*(int*)&m_pad_f4A[0] = idx;
 	}
 
 	static hook::cdecl_stub<uint32_t(audReferencedRingBuffer*, const void*, uint32_t)> _audReferencedRingBuffer_PushAudio([]()
@@ -801,6 +823,18 @@ namespace rage
 		_settingsIdx = hook::get_address<uint32_t*>(location + 9);
 		_settingsBase = hook::get_address<uint64_t*>(location + 16);
 	});
+
+	struct audStreamPlayer
+	{
+		void* vtbl;
+		uint8_t pad[48 - 8];
+		audReferencedRingBuffer* ringBuffer; // +48
+		void* pad2; // +56
+		uint32_t pad3; // +64
+		uint32_t size; // +68
+		uint8_t pad4[11]; // +72
+		uint8_t frameOffset;
+	};
 }
 
 class naEnvironmentGroup : public rage::audEnvironmentGroupInterface
@@ -865,7 +899,7 @@ extern "C"
 #include <libswresample/swresample.h>
 };
 
-class MumbleAudioEntity : public rage::audEntity
+class MumbleAudioEntity : public rage::audEntity, public std::enable_shared_from_this<MumbleAudioEntity>
 {
 public:
 	MumbleAudioEntity(const std::wstring& name)
@@ -932,10 +966,17 @@ public:
 
 	void PushAudio(int16_t* pcm, int len);
 
+	void SetPoller(const std::function<void(int)>& poller)
+	{
+		m_poller = poller;
+	}
+
 	void SetSubmixId(int id)
 	{
 		m_submixId = id;
 	}
+
+	void Poll(int samples);
 
 private:
 	rage::audExternalStreamSound* m_sound;
@@ -955,13 +996,57 @@ private:
 
 	int m_submixId = -1;
 
+	int m_customEntryId = -1;
+
 	CPed* m_ped;
 
 	std::wstring m_name;
+
+	std::function<void(int)> m_poller;
 };
+
+
+static void (*g_origGenerateFrame)(rage::audStreamPlayer* self);
+static std::shared_mutex g_customEntriesLock;
+
+static std::map<int, std::weak_ptr<MumbleAudioEntity>> g_customEntries;
+
+void GenerateFrameHook(rage::audStreamPlayer* self)
+{
+	if (self->ringBuffer)
+	{
+		auto buffer = self->ringBuffer;
+		if (auto idx = buffer->GetCustomMode(); idx >= 0)
+		{
+			std::shared_ptr<MumbleAudioEntity> entity;
+
+			{
+				std::shared_lock _(g_customEntriesLock);
+				if (auto entry = g_customEntries.find(idx); entry != g_customEntries.end())
+				{
+					entity = entry->second.lock();
+				}
+			}
+
+			if (entity)
+			{
+				// every read (native frame) is 256 samples
+				entity->Poll(256 - self->frameOffset);
+			}
+		}
+	}
+
+	g_origGenerateFrame(self);
+}
 
 MumbleAudioEntity::~MumbleAudioEntity()
 {
+	if (m_customEntryId >= 0)
+	{
+		std::unique_lock _(g_customEntriesLock);
+		g_customEntries.erase(m_customEntryId);
+	}
+
 	// directly call MShutdown
 	// Shutdown will be called on the base object
 	MShutdown();
@@ -979,6 +1064,14 @@ void MumbleAudioEntity::Shutdown()
 	MShutdown();
 
 	rage::audEntity::Shutdown();
+}
+
+void MumbleAudioEntity::Poll(int samples)
+{
+	if (m_poller)
+	{
+		m_poller(samples);
+	}
 }
 
 static constexpr int kExtraAudioBuckets = 4;
@@ -1045,6 +1138,18 @@ void MumbleAudioEntity::MInit()
 
 		auto buffer = new rage::audReferencedRingBuffer();
 		buffer->SetBuffer(m_bufferData, size);
+
+		{
+			std::unique_lock _(g_customEntriesLock);
+			static std::atomic<int> i;
+			int id = ++i;
+
+			auto self = shared_from_this();
+			g_customEntries[id] = self;
+			m_customEntryId = id;
+
+			buffer->SetCustomMode(id);
+		}
 
 		m_sound->InitStreamPlayer(buffer, 1, 48000);
 		m_sound->PrepareAndPlay(nullptr, true, -1, false);
@@ -1114,12 +1219,29 @@ void MumbleAudioEntity::PreUpdateService(uint32_t)
 		if (m_overrideVolume >= 0.0f)
 		{
 			settings->SetVolume(rage::GetDbForLinear(m_overrideVolume));
-			*((char*)settings + 369) &= ~8;
+
+			if (xbr::IsGameBuildOrGreater<2189>())
+			{
+				// see initial set around "48 C7 41 68 00 00 80 3F"
+				*((char*)settings + 377) &= ~8;
+			}
+			else
+			{
+				*((char*)settings + 369) &= ~8;
+			}
 		}
 		else
 		{
 			settings->SetVolume(rage::GetDbForLinear(1.0f));
-			*((char*)settings + 369) |= 8;
+
+			if (xbr::IsGameBuildOrGreater<2189>())
+			{
+				*((char*)settings + 377) |= 8;
+			}
+			else
+			{
+				*((char*)settings + 369) |= 8;
+			}
 		}
 
 		if (m_overrideVolume >= 0.0f)
@@ -1142,7 +1264,7 @@ void MumbleAudioEntity::PreUpdateService(uint32_t)
 			m_positionForce = {};
 		}
 
-		settings->SetEnvironmentalLoudness(60);
+		settings->SetEnvironmentalLoudness(25);
 	}
 
 	// debugging position logic
@@ -1185,6 +1307,11 @@ void MumbleAudioEntity::PreUpdateService(uint32_t)
 			m_environmentGroup->SetInteriorLocation(interiorLocation);
 		}
 	}
+
+	if (m_poller)
+	{
+		//m_poller();
+	}
 }
 
 void MumbleAudioEntity::PushAudio(int16_t* pcm, int len)
@@ -1204,6 +1331,7 @@ public:
 	MumbleAudioSink(const std::wstring& name);
 	virtual ~MumbleAudioSink() override;
 
+	virtual void SetPollHandler(const std::function<void(int)>& poller) override;
 	virtual void SetPosition(float position[3], float distance, float overrideVolume) override;
 	virtual void PushAudio(int16_t* pcm, int len) override;
 
@@ -1219,6 +1347,8 @@ private:
 
 	int m_lastSubmixId = -1;
 	int m_lastPed = -1;
+
+	std::function<void(int)> m_poller;
 };
 
 static std::mutex g_sinksMutex;
@@ -1247,6 +1377,11 @@ MumbleAudioSink::~MumbleAudioSink()
 {
 	std::lock_guard<std::mutex> _(g_sinksMutex);
 	g_sinks.erase(this);
+}
+
+void MumbleAudioSink::SetPollHandler(const std::function<void(int)>& poller)
+{
+	m_poller = poller;
 }
 
 void MumbleAudioSink::SetPosition(float position[3], float distance, float overrideVolume)
@@ -1343,6 +1478,7 @@ void MumbleAudioSink::Process()
 		if (!m_entity)
 		{
 			m_entity = std::make_shared<MumbleAudioEntity>(m_name);
+			m_entity->SetPoller(m_poller);
 			m_entity->SetSubmixId(submixId);
 			m_entity->Init();
 
@@ -1719,6 +1855,15 @@ static HookFunction hookFunction([]()
 		MH_CreateHook(location, audMixerDevice_InitClientThreadStub, (void**)&g_origaudMixerDevice_InitClientThread);
 		MH_EnableHook(location);
 	}
+
+	// custom audio poll stuff
+	{
+		auto location = hook::get_pattern("48 8D 6C 24 30 8B 04 24 0F 29 75 30 0F 29 7D", -0x11);
+
+		MH_Initialize();
+		MH_CreateHook(location, GenerateFrameHook, (void**)&g_origGenerateFrame);
+		MH_EnableHook(location);
+	}
 });
 
 rage::audDspEffect* MakeRadioFX();
@@ -1875,14 +2020,20 @@ static InitFunction initFunction([]()
 		{
 			bool active = nui::HasMainUI() && (!netLibrary || netLibrary->GetConnectionState() == NetLibrary::CS_IDLE) && !arenaWarVariable.GetValue();
 
-			if (arenaWarVariableForce.GetValue())
-			{
-				active = true;
-			}
-
-			if (ShouldMuteGameAudio())
-			{
+			if (launch::IsSDKGuest()) {
 				active = false;
+			}
+			else
+			{
+				if (arenaWarVariableForce.GetValue())
+				{
+					active = true;
+				}
+
+				if (ShouldMuteGameAudio())
+				{
+					active = false;
+				}
 			}
 
 #if SMTEST

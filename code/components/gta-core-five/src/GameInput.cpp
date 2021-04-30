@@ -360,6 +360,11 @@ static hook::cdecl_stub<bool()> _isTextInputBoxActive([]
 	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 40 84 FF 74 15 E8", 10));
 });
 
+static hook::thiscall_stub<rage::ioInputSource*(void* control, rage::ioInputSource* outParam, int controlIdx, int unkN1, bool secondaryBinding, bool)> _control_getBinding([]()
+{
+	return hook::get_call(hook::get_pattern("40 88 6C 24 28 40 88 6C 24 20 E8 ? ? ? ? 41 8D", 10));
+});
+
 bool IsTagActive(const std::string& tag);
 
 void Binding::Update(rage::ioMapper* mapper)
@@ -630,16 +635,16 @@ void BindingManager::Initialize()
 
 std::shared_ptr<Binding> BindingManager::Bind(int ioSource, int ioParameter, const std::string& commandString)
 {
-	for (auto& binding : m_bindings)
+	for (auto it = m_bindings.begin(); it != m_bindings.end(); )
 	{
-		if (binding.second->GetCommand() == commandString && IsTagActive(binding.second->GetTag()))
+		if (it->second->GetCommand() == commandString && IsTagActive(it->second->GetTag()))
 		{
-			m_bindings.erase(binding.first);
-			break;
+			it = m_bindings.erase(it);
+			continue;
 		}
-	}
 
-	//m_bindings.erase({ ioSource, ioParameter });
+		it++;
+	}
 
 	auto binding = std::make_shared<Binding>(commandString);
 	binding->SetBinding({ ioSource, ioParameter });
@@ -863,6 +868,22 @@ namespace game
 			bindingManager.Bind(ioSource, ioParameter, command)->SetTag(tag);
 		}
 	}
+
+	bool IsControlKeyDown(int control)
+	{
+		rage::ioInputSource controlData;
+		rage::ioInputSource controlDataSecondary;
+		_control_getBinding(g_control, &controlData, control, -1, false, false);
+		_control_getBinding(g_control, &controlDataSecondary, control, -4, true, false);
+
+		// Comes from a mouse
+		if (controlData.source == 7)
+		{
+			return InputHook::IsMouseButtonDown(controlData.parameter);
+		}
+
+		return (InputHook::IsKeyDown(controlData.parameter) || InputHook::IsKeyDown(controlDataSecondary.parameter));
+	}
 }
 
 static uint32_t HashBinding(const std::string& key)
@@ -1042,11 +1063,6 @@ static void MapFuncHook(void* a1, uint32_t controlIdx, void* a3, void* a4)
 	}
 }
 
-static hook::thiscall_stub<rage::ioInputSource*(void* control, rage::ioInputSource* outParam, int controlIdx, int unkN1, bool secondaryBinding, bool)> _control_getBinding([]()
-{
-	return hook::get_call(hook::get_pattern("40 88 6C 24 28 40 88 6C 24 20 E8 ? ? ? ? 41 8D", 10));
-});
-
 void UpdateButtonPlumbing()
 {
 	rage::ioInputSource controlDatas[2];
@@ -1066,7 +1082,7 @@ void UpdateButtonPlumbing()
 		return bypass;
 	};
 
-	InputHook::SetControlBypasses({ mapBypass(controlDatas[0]), mapBypass(controlDatas[1]) });
+	InputHook::SetControlBypasses('B', { mapBypass(controlDatas[0]), mapBypass(controlDatas[1]) });
 }
 
 #include <boost/algorithm/string.hpp>
@@ -1205,6 +1221,16 @@ static HookFunction hookFunction([]()
 		auto location = hook::get_pattern("48 C1 FA 02 48 8B C2 48 C1 E8 3F 48 03 D0 E8", 14);
 		hook::set_call(&g_origMapFunc, location);
 		hook::call(location, MapFuncHook);
+	}
+
+	// GetControlInstructionalButton
+	{
+		// limit check
+		auto location = hook::get_pattern<char>("81 FA ? ? 00 00 77 4F 48", -6);
+		hook::nop(location + 12, 2);
+
+		// return array index (force to 0)
+		hook::put<uint32_t>(location + 0x24, 0x90DB3148);
 	}
 
 	// control

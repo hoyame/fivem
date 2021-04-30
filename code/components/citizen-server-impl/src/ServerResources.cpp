@@ -30,6 +30,8 @@
 
 #include <filesystem>
 
+#include <ManifestVersion.h>
+
 // a set of resources that are system-managed and should not be stopped from script
 static std::set<std::string> g_managedResources = {
 	"spawnmanager",
@@ -103,6 +105,7 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::Client
 	static fx::RateLimiterStore<uint32_t, false> netEventRateLimiterStore{ instance->GetComponent<console::Context>().GetRef() };
 	static auto netEventRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEvent", fx::RateLimiterDefaults{ 50.f, 200.f });
 	static auto netFloodRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEventFlood", fx::RateLimiterDefaults{ 75.f, 300.f });
+	static auto netEventSizeRateLimiter = netEventRateLimiterStore.GetRateLimiter("netEventSize", fx::RateLimiterDefaults{ 128 * 1024.0, 384 * 1024.0 });
 
 	uint32_t netId = client->GetNetId();
 
@@ -124,6 +127,18 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const fx::Client
 	buffer.Read<uint8_t>();
 
 	uint32_t dataLength = buffer.GetRemainingBytes();
+
+	if (!netEventSizeRateLimiter->Consume(netId, double(dataLength)))
+	{
+		gscomms_execute_callback_on_main_thread([client, instance]()
+		{
+			// if this happens, try increasing rateLimiter_netEventSize_rate and rateLimiter_netEventSize_burst
+			// preferably, fix client scripts to not have this large a set of events with high frequency
+			instance->GetComponent<fx::GameServer>()->DropClient(client, "Reliable network event size overflow.");
+		});
+
+		return;
+	}
 
 	std::vector<uint8_t> data(dataLength);
 	buffer.Read(data.data(), data.size());
@@ -159,6 +174,10 @@ static void ScanResources(fx::ServerInstanceBase* instance)
 
 	// save scanned resource names so we don't scan them twice
 	std::set<std::string> scannedNow;
+	size_t newResources = 0;
+	size_t reloadedResources = 0;
+
+	trace("^2Scanning resources.^7\n", newResources);
 
 	while (!pathsToIterate.empty())
 	{
@@ -199,10 +218,12 @@ static void ScanResources(fx::ServerInstanceBase* instance)
 						if (oldRes.GetRef())
 						{
 							oldRes->GetComponent<fx::ResourceMetaDataComponent>()->LoadMetaData(resPath);
+							reloadedResources++;
 						}
 						else
 						{
-							trace("Found new resource %s in %s\n", findData.name, resPath);
+							console::DPrintf("resources", "Found new resource %s in %s\n", findData.name, resPath);
+							newResources++;
 
 							auto path = std::filesystem::u8path(resPath);
 
@@ -284,6 +305,52 @@ static void ScanResources(fx::ServerInstanceBase* instance)
 
 	pplx::when_all(tasks.begin(), tasks.end()).wait();
 
+	if (reloadedResources > 0)
+	{
+		trace("^2Found %d resources, and refreshed %d resources.^7\n", newResources, reloadedResources);
+	}
+	else
+	{
+		trace("^2Found %d resources.^7\n", newResources);
+	}
+
+	auto trl = instance->GetComponent<fx::TokenRateLimiter>();
+	trl->Update(1.0, std::max(double(newResources + reloadedResources), 3.0));
+
+	// check for outdated
+	std::set<std::string> nonManifestResources;
+
+	resMan->ForAllResources([&nonManifestResources](const fwRefContainer<fx::Resource>& resource)
+	{
+		auto md = resource->GetComponent<fx::ResourceMetaDataComponent>();
+
+		auto fxV2 = md->IsManifestVersionBetween("adamant", "");
+		auto fxV1 = md->IsManifestVersionBetween(ManifestVersion{ "44febabe-d386-4d18-afbe-5e627f4af937" }.guid, guid_t{ 0 });
+
+		if (!fxV2 || !*fxV2)
+		{
+			if (!fxV1 || !*fxV1)
+			{
+				if (!md->GlobEntriesVector("client_script").empty())
+				{
+					nonManifestResources.insert(resource->GetName());
+				}
+			}
+		}
+	});
+
+	if (!nonManifestResources.empty())
+	{
+		trace("^1Some resources have an outdated resource manifest:^7\n");
+
+		for (auto& name : nonManifestResources)
+		{
+			trace("    - %s\n", name);
+		}
+
+		trace("\nPlease update these resources.\n");
+	}
+
 	/*NETEV onResourceListRefresh SERVER
 	/#*
 	 * A server-side event triggered when the `refresh` command completes.
@@ -358,6 +425,7 @@ static InitFunction initFunction([]()
 	{
 		instance->SetComponent(fx::CreateResourceManager());
 		instance->SetComponent(new fx::ServerEventComponent());
+		instance->SetComponent(new fx::TokenRateLimiter(1.0f, 3.0f));
 
 		fwRefContainer<fx::ResourceManager> resman = instance->GetComponent<fx::ResourceManager>();
 		resman->SetComponent(new fx::ServerInstanceBaseRef(instance));
@@ -416,8 +484,21 @@ static InitFunction initFunction([]()
 				bool allowed = true;
 
 				// store the game name
-				std::string gameNameString = (gameServer->GetGameName() == fx::GameName::GTA5) ? "gta5" :
-					(gameServer->GetGameName() == fx::GameName::RDR3) ? "rdr3" : "unknown";
+				std::string gameNameString;
+				switch (gameServer->GetGameName())
+				{
+				case fx::GameName::GTA4:
+					gameNameString = "gta4";
+					break;
+				case fx::GameName::GTA5:
+					gameNameString = "gta5";
+					break;
+				case fx::GameName::RDR3:
+					gameNameString = "rdr3";
+					break;
+				default:
+					gameNameString = "unknown";
+				}
 
 				// if is FXv2
 				auto isCfxV2 = md->GetEntries("is_cfxv2");
@@ -732,7 +813,7 @@ static InitFunction initFunction([]()
 
 				try
 				{
-					return eventComponent->TriggerEvent2("__cfx_internal:commandFallback", { "net:" + context }, rawCommand);
+					return eventComponent->TriggerEvent2("__cfx_internal:commandFallback", { "internal-net:" + context }, rawCommand);
 				}
 				catch (std::bad_any_cast& e)
 				{

@@ -18,6 +18,7 @@
 #include <CoreConsole.h>
 #include <ICoreGameInit.h>
 #include <GameInit.h>
+#include <ScriptEngine.h>
 //New libs needed for saveSettings
 #include <fstream>
 #include <sstream>
@@ -64,6 +65,16 @@ static LONG WINAPI TerminateInstantly(LPEXCEPTION_POINTERS pointers)
 	return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static void SaveBuildNumber(uint32_t build)
+{
+	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+
+	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		WritePrivateProfileString(L"Game", L"SavedBuildNumber", fmt::sprintf(L"%d", build).c_str(), fpath.c_str());
+	}
+}
+
 void RestartGameToOtherBuild(int build = 0)
 {
 #if defined(GTA_FIVE) || defined(IS_RDR3)
@@ -72,17 +83,35 @@ void RestartGameToOtherBuild(int build = 0)
 
 	if (!build)
 	{
-		cli = va(L"\"%s\" %s -switchcl +connect \"%s\"",
+		cli = va(L"\"%s\" %s -switchcl \"fivem://connect/%s\"",
 		hostData->gameExePath,
 		Is2060() ? L"" : L"-b2060",
 		ToWide(g_lastConn));
+
+		build = (Is2060()) ? 1604 : 2060;
 	}
 	else
 	{
-		cli = va(L"\"%s\" %s -switchcl +connect \"%s\"",
+		cli = va(L"\"%s\" %s -switchcl \"fivem://connect/%s\"",
 		hostData->gameExePath,
 		build == 1604 ? L"" : fmt::sprintf(L"-b%d", build),
 		ToWide(g_lastConn));
+	}
+
+	uint32_t defaultBuild =
+#ifdef GTA_FIVE
+	1604
+#elif defined(IS_RDR3)
+	1311
+#else
+	0
+#endif
+	;
+
+	// we won't launch the default build if we don't do this
+	if (build == defaultBuild)
+	{
+		SaveBuildNumber(defaultBuild);
 	}
 
 	STARTUPINFOW si = { 0 };
@@ -196,7 +225,7 @@ static void ConnectTo(const std::string& hostnameStr, bool fromUI = false, const
 		switched = true;
 	}
 
-	if (!fromUI)
+	if (!fromUI && !launch::IsSDKGuest())
 	{
 		if (nui::HasMainUI())
 		{
@@ -381,6 +410,17 @@ static void UpdateJumpList(const std::vector<ServerLink>& links)
 
 void DLL_IMPORT UiDone();
 
+static void UpdatePendingAuthPayload()
+{
+	if (!g_pendingAuthPayload.empty())
+	{
+		auto pendingAuthPayload = g_pendingAuthPayload;
+		g_pendingAuthPayload = "";
+
+		HandleAuthPayload(pendingAuthPayload);
+	}
+}
+
 static InitFunction initFunction([] ()
 {
 	static std::function<void()> g_onYesCallback;
@@ -419,19 +459,47 @@ static InitFunction initFunction([] ()
 			g_connected = false;
 		});
 
-		netLibrary->OnConnectionError.Connect([] (const char* error)
+		netLibrary->OnConnectionError.Connect([] (const char* errorStr)
 		{
+			std::string error(errorStr);
 #ifdef GTA_FIVE
-			if (strstr(error, "This server requires a different game build"))
+			if (strstr(error.c_str(), "This server requires a different game build"))
 			{
 				RestartGameToOtherBuild();
 			}
 #endif
 
+			if (strstr(error.c_str(), "steam") || strstr(error.c_str(), "Steam"))
+			{
+				if (auto steam = GetSteam())
+				{
+					if (steam->IsSteamRunning())
+					{
+						if (IClientEngine* steamClient = steam->GetPrivateClient())
+						{
+							InterfaceMapper steamUser(steamClient->GetIClientUser(steam->GetHSteamUser(), steam->GetHSteamPipe(), "CLIENTUSER_INTERFACE_VERSION001"));
+
+							if (steamUser.IsValid())
+							{
+								uint64_t steamID = 0;
+								steamUser.Invoke<void>("GetSteamID", &steamID);
+
+								if ((steamID & 0xFFFFFFFF00000000) != 0)
+								{
+									error += "\nThis is a Steam authentication failure, but you are running Steam and it is signed in. The server owner can find more information in their server console.";
+								}
+							}
+						}
+					}
+				}
+			}
+
+			console::Printf("no_console", "OnConnectionError: %s\n", error);
+
 			g_connected = false;
 
 			rapidjson::Document document;
-			document.SetString(error, document.GetAllocator());
+			document.SetString(error.c_str(), document.GetAllocator());
 
 			rapidjson::StringBuffer sbuffer;
 			rapidjson::Writer<rapidjson::StringBuffer> writer(sbuffer);
@@ -440,11 +508,13 @@ static InitFunction initFunction([] ()
 
 			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectFailed", "message": %s })", sbuffer.GetString()));
 
-			ep.Call("connectionError", std::string(error));
+			ep.Call("connectionError", error);
 		});
 
 		netLibrary->OnConnectionProgress.Connect([] (const std::string& message, int progress, int totalProgress)
 		{
+			console::Printf("no_console", "OnConnectionProgress: %s\n", message);
+
 			rapidjson::Document document;
 			document.SetObject();
 			document.AddMember("message", rapidjson::Value(message.c_str(), message.size(), document.GetAllocator()), document.GetAllocator());
@@ -483,6 +553,11 @@ static InitFunction initFunction([] ()
 			}
 
 			ep.Call("connectionError", std::string("Cards don't exist here yet!"));
+		});
+
+		netLibrary->OnStateChanged.Connect([](NetLibrary::ConnectionState currentState, NetLibrary::ConnectionState previousState)
+		{
+			ep.Call("connectionStateChanged", (int)currentState, (int)previousState);
 		});
 
 		static std::function<void()> finishConnectCb;
@@ -593,6 +668,19 @@ static InitFunction initFunction([] ()
 		g_connected = false;
 	});
 
+	if (launch::IsSDKGuest())
+	{
+		fx::ScriptEngine::RegisterNativeHandler("SEND_SDK_MESSAGE", [](fx::ScriptContext& context)
+		{
+			ep.Call("sdk:message", std::string(context.GetArgument<const char*>(0)));
+		});
+
+		console::CoreAddPrintListener([](ConsoleChannel channel, const char* msg)
+		{
+			ep.Call("sdk:consoleMessage", channel, std::string(msg));
+		});
+	}
+
 	static ConsoleCommand connectCommand("connect", [](const std::string& server)
 	{
 		ConnectTo(server);
@@ -655,6 +743,15 @@ static InitFunction initFunction([] ()
 		SetWindowPos(wnd, NULL, 0, 0, w, h, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_ASYNCWINDOWPOS);
 	});
 
+	ep.Bind("sdk:invokeNative", [](const std::string& nativeType, const std::string& argumentData)
+	{
+		if (nativeType == "sendCommand")
+		{
+			se::ScopedPrincipal ps{ se::Principal{"system.console"} };
+			console::GetDefaultContext()->ExecuteSingleCommand(argumentData);
+		}
+	});
+
 	static ConsoleCommand disconnectCommand("disconnect", []()
 	{
 		if (netLibrary->GetConnectionState() != 0)
@@ -674,13 +771,13 @@ static InitFunction initFunction([] ()
 	curChannel = ToNarrow(resultPath);
 
 	static ConVar<bool> uiPremium("ui_premium", ConVar_None, false);
-	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_None, curChannel);
 
-	OnGameFrame.Connect([]()
+	static ConVar<std::string> uiUpdateChannel("ui_updateChannel", ConVar_None, curChannel,
+	[](internal::ConsoleVariableEntry<std::string>* convar)
 	{
-		if (uiUpdateChannel.GetValue() != curChannel)
+		if (convar->GetValue() != curChannel)
 		{
-			curChannel = uiUpdateChannel.GetValue();
+			curChannel = convar->GetValue();
 
 			WritePrivateProfileString(L"Game", L"UpdateChannel", ToWide(curChannel).c_str(), fpath.c_str());
 
@@ -706,7 +803,11 @@ static InitFunction initFunction([] ()
 
 	nui::OnInvokeNative.Connect([](const wchar_t* type, const wchar_t* arg)
 	{
-		if (!_wcsicmp(type, L"getMinModeInfo"))
+		if (!_wcsicmp(type, L"getFavorites"))
+		{
+			UpdatePendingAuthPayload();
+		}
+		else if (!_wcsicmp(type, L"getMinModeInfo"))
 		{
 #ifdef GTA_FIVE
 			static bool done = ([]
@@ -823,7 +924,12 @@ static InitFunction initFunction([] ()
 		}
 		else if (!_wcsicmp(type, L"checkNickname"))
 		{
-			if (!arg || !arg[0] || !netLibrary) return;
+			if (!arg || !arg[0] || !netLibrary)
+			{
+				trace("Failed to set nickname\n");
+				return;
+			}
+
 			const char* text = netLibrary->GetPlayerName();
 			std::string newusername = ToNarrow(arg);
 
@@ -833,14 +939,7 @@ static InitFunction initFunction([] ()
 				netLibrary->SetPlayerName(newusername.c_str());
 			}
 
-			if (!g_pendingAuthPayload.empty())
-			{
-				auto pendingAuthPayload = g_pendingAuthPayload;
-
-				g_pendingAuthPayload = "";
-
-				HandleAuthPayload(pendingAuthPayload);
-			}
+			UpdatePendingAuthPayload();
 		}
 		else if (!_wcsicmp(type, L"exit"))
 		{
@@ -999,12 +1098,15 @@ static InitFunction initFunction([] ()
 		ep.Call("disconnected");
 
 		nui::SetMainUI(true);
+		nui::SwitchContext("");
 
 		nui::CreateFrame("mpMenu", console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("ui_url")->GetValue());
 	});
 });
 
+#ifndef GTA_NY
 #include <gameSkeleton.h>
+#endif
 #include <shellapi.h>
 
 #include <nng/nng.h>
@@ -1132,6 +1234,8 @@ void Component_RunPreInit()
 	{
 		if (hostData->IsMasterProcess() || hostData->IsGameProcess())
 		{
+// #TODOLIBERTY: ?
+#ifndef GTA_NY
 			rage::OnInitFunctionStart.Connect([](rage::InitFunctionType type)
 			{
 				if (type == rage::InitFunctionType::INIT_CORE)
@@ -1141,6 +1245,7 @@ void Component_RunPreInit()
 					connectParams = "";
 				}
 			}, 999999);
+#endif
 		}
 		else
 		{
@@ -1171,6 +1276,8 @@ void Component_RunPreInit()
 	{
 		if (hostData->IsMasterProcess() || hostData->IsGameProcess())
 		{
+// #TODOLIBERTY: ?
+#ifndef GTA_NY
 			rage::OnInitFunctionStart.Connect([](rage::InitFunctionType type)
 			{
 				if (type == rage::InitFunctionType::INIT_CORE)
@@ -1179,6 +1286,7 @@ void Component_RunPreInit()
 					authPayload = "";
 				}
 			}, 999999);
+#endif
 		}
 		else
 		{
@@ -1205,6 +1313,16 @@ void Component_RunPreInit()
 
 static InitFunction connectInitFunction([]()
 {
+#if __has_include(<gameSkeleton.h>)
+	rage::OnInitFunctionStart.Connect([](rage::InitFunctionType type)
+	{
+		if (type == rage::INIT_BEFORE_MAP_LOADED)
+		{
+			SaveBuildNumber(xbr::GetGameBuild());
+		}
+	});
+#endif
+
 	static nng_socket netSocket;
 	static nng_listener listener;
 
@@ -1517,9 +1635,8 @@ static InitFunction mediaRequestInit([]()
 					ImGui::Separator();
 					ImGui::Text("Press ^2F8^7 to accept/deny.");
 				}
-
-				ImGui::End();
 			}
+			ImGui::End();
 		}
 	});
 });

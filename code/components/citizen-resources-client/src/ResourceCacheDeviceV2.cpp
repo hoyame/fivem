@@ -69,11 +69,7 @@ bool RcdBaseStream::EnsureRead(const std::function<void(bool, const std::string&
 				});
 			}
 
-			if (m_fetcher->IsBlocking())
-			{
-				task.wait();
-			}
-			else
+			if (!m_fetcher->IsBlocking())
 			{
 				if (!task.is_done())
 				{
@@ -383,6 +379,9 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 				SHA_CTX sha1;
 				size_t numRead;
 
+				size_t readNow = 0;
+				size_t readTotal = localStream->GetLength();
+
 				// initialize context
 				SHA1_Init(&sha1);
 
@@ -393,6 +392,9 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 					{
 						break;
 					}
+
+					readNow += numRead;
+					fx::OnCacheVerifyStatus(fmt::sprintf("%s%s/%s", m_pathPrefix, entry.resourceName, entry.basename), readNow, readTotal);
 
 					SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 				}
@@ -425,7 +427,7 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 		}
 		else if (downloaded)
 		{
-			lastError = "Failed to add entry to local storage";
+			lastError = "Failed to add entry to local storage (download corrupted?)";
 		}
 		
 		if (!result)
@@ -672,10 +674,14 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 			data->flags.version = atoi(extData["rscVersion"].c_str());
 			data->flags.virtPages = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
 			data->flags.physPages = strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10);
-#else
+#elif defined(GTA_FIVE)
 			data->version = atoi(extData["rscVersion"].c_str());
 			data->flags.flag1 = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
 			data->flags.flag2 = strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10);
+#elif defined(GTA_NY)
+			data->version = atoi(extData["rscVersion"].c_str());
+			data->flags.flag1 = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
+			// flag2 would be out of bounds
 #endif
 			return true;
 		}

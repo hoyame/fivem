@@ -44,6 +44,7 @@
 	"citizen:scripting:lua",
 	"citizen:scripting:lua54",
 	"citizen:scripting:v8",
+	"citizen:scripting:v8next",
 	"scripting:gta",
 	"citizen:resources:client",
 	"citizen:legacy-net:resources",
@@ -56,10 +57,10 @@
 	"discord",
 	"voip:mumble",
 	"scrbind:base",
-	"n19ui",
 	"citizen:mod-loader:five",
 	"adhesive",
 	"citizen:game:ipc",
+	"legacy-game:re3",
 	"fxdk:main",
 	"citizen:devtools"
 ]

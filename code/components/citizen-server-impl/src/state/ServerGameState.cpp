@@ -8,6 +8,7 @@
 #include <NetBuffer.h>
 
 #include <lz4.h>
+#include <lz4hc.h>
 
 #include <tbb/concurrent_queue.h>
 #include <tbb/parallel_for_each.h>
@@ -417,13 +418,15 @@ uint32_t ServerGameState::MakeScriptHandle(const fx::sync::SyncEntityPtr& ptr)
 	}
 }
 
-glm::vec3 GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity)
+using FocusResult = eastl::fixed_vector<glm::vec3, 5>;
+
+FocusResult GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity)
 {
 	auto syncTree = entity->syncTree;
 
 	if (!syncTree)
 	{
-		return { 0, 0, 0 };
+		return {};
 	}
 
 	float playerPos[3];
@@ -433,18 +436,24 @@ glm::vec3 GetPlayerFocusPos(const fx::sync::SyncEntityPtr& entity)
 
 	if (!camData)
 	{
-		return { playerPos[0], playerPos[1], playerPos[2] };
+		return { { playerPos[0], playerPos[1], playerPos[2] } };
 	}
 
 	switch (camData->camMode)
 	{
 	case 0:
 	default:
-		return { playerPos[0], playerPos[1], playerPos[2] };
+		return { { playerPos[0], playerPos[1], playerPos[2] } };
 	case 1:
-		return { camData->freeCamPosX, camData->freeCamPosY, camData->freeCamPosZ };
+		return {
+			{ playerPos[0], playerPos[1], playerPos[2] },
+			{ camData->freeCamPosX, camData->freeCamPosY, camData->freeCamPosZ }
+		};
 	case 2:
-		return { playerPos[0] + camData->camOffX, playerPos[1] + camData->camOffY, playerPos[2] + camData->camOffZ };
+		return {
+			{ playerPos[0], playerPos[1], playerPos[2] },
+			{ playerPos[0] + camData->camOffX, playerPos[1] + camData->camOffY, playerPos[2] + camData->camOffZ }
+		};
 	}
 }
 
@@ -704,7 +713,7 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 					// entity was requested as delete, nobody knows of it anymore: finalize
 					if (entity->deleting)
 					{
-						FinalizeClone({}, entity->handle, 0, "Requested deletion");
+						FinalizeClone({}, entity, entity->handle, 0, "Requested deletion");
 						continue;
 					}
 					// it's a client-owned entity, let's check for a few things
@@ -714,14 +723,14 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 						if (entity->firstOwnerDropped)
 						{
 							// we can delete
-							FinalizeClone({}, entity->handle, 0, "First owner dropped");
+							FinalizeClone({}, entity, entity->handle, 0, "First owner dropped");
 							continue;
 						}
 					}
 					// it's a script-less entity, we can collect it.
 					else if (!entity->IsOwnedByScript() && (entity->type != sync::NetObjEntityType::Player || !entity->GetClient()))
 					{
-						FinalizeClone({}, entity->handle, 0, "Regular entity GC");
+						FinalizeClone({}, entity, entity->handle, 0, "Regular entity GC");
 						continue;
 					}
 				}
@@ -796,11 +805,11 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			playerEntity = clientDataUnlocked->playerEntity.lock();
 		}
 
-		glm::vec3 playerPos;
+		FocusResult playerPosns;
 
 		if (playerEntity)
 		{
-			playerPos = GetPlayerFocusPos(playerEntity);
+			playerPosns = GetPlayerFocusPos(playerEntity);
 		}
 
 		auto slotId = client->GetSlotId();
@@ -834,15 +843,20 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				if (playerEntity)
 				{
-					float diffX = entityPos.x - playerPos.x;
-					float diffY = entityPos.y - playerPos.y;
-
-					float distSquared = (diffX * diffX) + (diffY * diffY);
-					if (distSquared < entity->GetDistanceCullingRadius())
+					for (auto& playerPos : playerPosns)
 					{
-						isRelevant = true;
+						float diffX = entityPos.x - playerPos.x;
+						float diffY = entityPos.y - playerPos.y;
+
+						float distSquared = (diffX * diffX) + (diffY * diffY);
+						if (distSquared < entity->GetDistanceCullingRadius(clientDataUnlocked->GetPlayerCullingRadius()))
+						{
+							isRelevant = true;
+							break;
+						}
 					}
-					else
+					
+					if (!isRelevant)
 					{
 						// are we owning the world grid in which this entity exists?
 						int sectorX = std::max(entityPos.x + 8192.0f, 0.0f) / 150;
@@ -1016,7 +1030,13 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 
 					if (playerEntity)
 					{
-						auto dist = glm::distance2(position, playerPos);
+						float dist = std::numeric_limits<float>::max();
+
+						for (const auto& playerPos : playerPosns)
+						{
+							auto thisDist = glm::distance2(position, playerPos);
+							dist = std::min(thisDist, dist);
+						}
 
 						if (dist > 500.0f * 500.0f)
 						{
@@ -1037,7 +1057,13 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			{
 				if (playerEntity)
 				{
-					auto dist = glm::distance2(entityPos, playerPos);
+					float dist = std::numeric_limits<float>::max();
+
+					for (const auto& playerPos : playerPosns)
+					{
+						auto thisDist = glm::distance2(entityPos, playerPos);
+						dist = std::min(thisDist, dist);
+					}
 
 					if (dist < 35.0f * 35.0f)
 					{
@@ -1090,7 +1116,8 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 	// gather client refs
 	eastl::fixed_vector<fx::ClientSharedPtr, MAX_CLIENTS> clientRefs;
 
-	creg->ForAllClients([&clientRefs](const fx::ClientSharedPtr& clientRef)
+	// since we're doing essentially the same thing as what ForAllClients does, we use ForAllClientsLocked to prevent extra copies
+	creg->ForAllClientsLocked([&clientRefs](const fx::ClientSharedPtr& clientRef)
 	{
 		clientRefs.push_back(clientRef);
 	});
@@ -1136,11 +1163,11 @@ void ServerGameState::Tick(fx::ServerInstanceBase* instance)
 			playerEntity = clientDataUnlocked->playerEntity.lock();
 		}
 
-		glm::vec3 playerPos;
+		FocusResult playerPosns;
 
 		if (playerEntity)
 		{
-			playerPos = GetPlayerFocusPos(playerEntity);
+			playerPosns = GetPlayerFocusPos(playerEntity);
 		}
 
 	
@@ -1865,6 +1892,7 @@ void ServerGameState::UpdateEntities()
 					if (curVehicleData && curVehicleData->occupants[vehicleData->curVehicleSeat] == 0)
 					{
 						curVehicleData->occupants[vehicleData->curVehicleSeat] = pedHandle;
+						curVehicleData->lastOccupant[vehicleData->curVehicleSeat] = pedHandle;
 
 						if (entity->type == sync::NetObjEntityType::Player)
 						{
@@ -2053,7 +2081,15 @@ void ServerGameState::UpdateWorldGrid(fx::ServerInstanceBase* instance)
 			return;
 		}
 
-		auto pos = GetPlayerFocusPos(playerEntity);
+		auto posns = GetPlayerFocusPos(playerEntity);
+
+		if (posns.empty())
+		{
+			return;
+		}
+
+		// only set world grid for the most focused position
+		const auto& pos = posns[0];
 
 		int minSectorX = std::max((pos.x - 299.0f) + 8192.0f, 0.0f) / 150;
 		int maxSectorX = std::max((pos.x + 299.0f) + 8192.0f, 0.0f) / 150;
@@ -2349,11 +2385,11 @@ bool ServerGameState::MoveEntityToCandidate(const fx::sync::SyncEntityPtr& entit
 
 				if (playerEntity)
 				{
-					auto tgt = GetPlayerFocusPos(playerEntity);
+					auto tgts = GetPlayerFocusPos(playerEntity);
 
-					if (pos.x != 0.0f)
+					if (pos.x != 0.0f && !tgts.empty())
 					{
-						distance = glm::distance2(tgt, pos);
+						distance = glm::distance2(tgts[0], pos);
 					}
 				}
 
@@ -2715,7 +2751,7 @@ void ServerGameState::RemoveClone(const fx::ClientSharedPtr& client, uint16_t ob
 	}
 }
 
-void ServerGameState::FinalizeClone(const fx::ClientSharedPtr& client, uint16_t objectId, uint16_t uniqifier, std::string_view finalizeReason)
+void ServerGameState::FinalizeClone(const fx::ClientSharedPtr& client, const fx::sync::SyncEntityPtr& entity, uint16_t objectId, uint16_t uniqifier, std::string_view finalizeReason)
 {
 	sync::SyncEntityPtr entityRef;
 
@@ -2724,7 +2760,7 @@ void ServerGameState::FinalizeClone(const fx::ClientSharedPtr& client, uint16_t 
 		entityRef = m_entitiesById[objectId].lock();
 	}
 
-	if (entityRef)
+	if (entityRef && entityRef == entity)
 	{
 		if (!entityRef->finalizing)
 		{
@@ -2732,36 +2768,36 @@ void ServerGameState::FinalizeClone(const fx::ClientSharedPtr& client, uint16_t 
 
 			GS_LOG("%s: finalizing object %d (for reason %s)\n", __func__, objectId, finalizeReason);
 
-			bool stolen = false;
-
-			{
-				std::unique_lock objectIdsLock(m_objectIdsMutex);
-				m_objectIdsUsed.reset(objectId);
-
-				if (m_objectIdsStolen.test(objectId))
-				{
-					stolen = true;
-
-					m_objectIdsSent.reset(objectId);
-					m_objectIdsStolen.reset(objectId);
-				}
-			}
-
-			if (stolen)
-			{
-				fx::ClientSharedPtr clientRef = entityRef->GetClient();
-				if (clientRef)
-				{
-					auto [lock, clientData] = GetClientData(this, clientRef);
-					clientData->objectIds.erase(objectId);
-				}
-			}
-
 			OnCloneRemove(entityRef, [this, objectId, entityRef]()
 			{
 				{
 					std::unique_lock entitiesByIdLock(m_entitiesByIdMutex);
 					m_entitiesById[objectId].reset();
+				}
+
+				bool stolen = false;
+
+				{
+					std::unique_lock objectIdsLock(m_objectIdsMutex);
+					m_objectIdsUsed.reset(objectId);
+
+					if (m_objectIdsStolen.test(objectId))
+					{
+						stolen = true;
+
+						m_objectIdsSent.reset(objectId);
+						m_objectIdsStolen.reset(objectId);
+					}
+				}
+
+				if (stolen)
+				{
+					fx::ClientSharedPtr clientRef = entityRef->GetClient();
+					if (clientRef)
+					{
+						auto [lock, clientData] = GetClientData(this, clientRef);
+						clientData->objectIds.erase(objectId);
+					}
 				}
 
 				{
@@ -3225,8 +3261,12 @@ static std::tuple<std::optional<net::Buffer>, uint32_t> UncompressClonePacket(co
 		return { std::optional<net::Buffer>{}, type };
 	}
 
-	uint8_t bufferData[16384] = { 0 };
-	int bufferLength = LZ4_decompress_safe(reinterpret_cast<const char*>(&readBuffer.GetData()[4]), reinterpret_cast<char*>(bufferData), readBuffer.GetRemainingBytes(), sizeof(bufferData));
+	const static uint8_t dictBuffer[65536] = 
+	{
+#include <state/dict_five_20210329.h>
+	};
+	uint8_t bufferData[16384];
+	int bufferLength = LZ4_decompress_safe_usingDict(reinterpret_cast<const char*>(&readBuffer.GetData()[4]), reinterpret_cast<char*>(bufferData), readBuffer.GetRemainingBytes(), sizeof(bufferData), reinterpret_cast<const char*>(dictBuffer), std::size(dictBuffer));
 
 	if (bufferLength <= 0)
 	{

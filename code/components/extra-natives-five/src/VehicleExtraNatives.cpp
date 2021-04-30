@@ -10,7 +10,7 @@
 #include <ScriptEngine.h>
 #include <atArray.h>
 
-#include <Local.h>
+#include <jitasm.h>
 #include <Hooking.h>
 #include <GameInit.h>
 #include <nutsnbolts.h>
@@ -196,6 +196,7 @@ static int TurboBoostOffset; // = 0x8D8;
 static int ClutchOffset; // = 0x8C0;
 //static int VisualHeightGetOffset = 0x080; // There is a vanilla native for this.
 static int VisualHeightSetOffset = 0x07C;
+static int LightMultiplierGetOffset;
 
 // TODO: Wheel class.
 static int WheelYRotOffset = 0x008;
@@ -363,6 +364,7 @@ static HookFunction initFunction([]()
 		VehicleCheatPowerIncreaseOffset = *hook::get_pattern<uint32_t>("E8 ? ? ? ? 8B 83 ? ? ? ? C7 83", 23);
 		WheelSurfaceMaterialOffset = *hook::get_pattern<uint32_t>("48 8B 4A 10 0F 28 CF F3 0F 59 05", -4);
 		WheelHealthOffset = *hook::get_pattern<uint32_t>("75 24 F3 0F 10 ? ? ? 00 00 F3 0F", 6);
+		LightMultiplierGetOffset = *hook::get_pattern<uint32_t>("00 00 48 8B CE F3 0F 59 ? ? ? 00 00 F3 41", 9);
 	}
 
 	{
@@ -944,6 +946,8 @@ static HookFunction initFunction([]()
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_INDICATOR_LIGHTS", std::bind(readVehicleMemory<unsigned char, &BlinkerStateOffset>, _1, "GET_VEHICLE_INDICATOR_LIGHTS"));
 
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_LIGHT_MULTIPLIER", std::bind(readVehicleMemory<float, &LightMultiplierGetOffset>, _1, "GET_VEHICLE_LIGHT_MULTIPLIER"));
+
 	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_WHEELIE_STATE", std::bind(readVehicleMemory<unsigned char, &WheelieStateOffset>, _1, "GET_VEHICLE_WHEELIE_STATE"));
 	fx::ScriptEngine::RegisterNativeHandler("SET_VEHICLE_WHEELIE_STATE", std::bind(writeVehicleMemory<unsigned char, &WheelieStateOffset>, _1, "SET_VEHICLE_WHEELIE_STATE"));
 
@@ -1063,9 +1067,17 @@ static HookFunction initFunction([]()
 
 	if (GetModuleHandle(L"AdvancedHookV.dll") == nullptr)
 	{
-		auto repairFunc = hook::get_pattern("F7 D0 48 8B CB 21 83 ? ? ? ? E8 ? ? ? ? 48 8B 03", 27);
-		hook::nop(repairFunc, 6);
-		hook::call_reg<2>(repairFunc, asmfunc.GetCode());
+		{
+			auto repairFunc = hook::get_pattern("F7 D0 48 8B CB 21 83 ? ? ? ? E8 ? ? ? ? 48 8B 03", 27);
+			hook::nop(repairFunc, 6);
+			hook::call_reg<2>(repairFunc, asmfunc.GetCode());
+		}
+
+		{
+			auto repairFunc = hook::get_pattern("FF 90 ? ? ? ? 8A 83 ? ? ? ? 24 07");
+			hook::nop(repairFunc, 6);
+			hook::call_reg<2>(repairFunc, asmfunc.GetCode());
+		}
 	}
 
 	rage::OnInitFunctionEnd.Connect([](rage::InitFunctionType type)
@@ -1189,6 +1201,14 @@ static bool g_useWGI = true;
 
 static DWORD WINAPI XInputGetStateHook(_In_ DWORD dwUserIndex, _Out_ XINPUT_STATE* pState)
 {
+	// if we're running Steam, don't - Steam will crash in numerous scenarios.
+	static auto gameOverlay = GetModuleHandleW(L"gameoverlayrenderer64.dll");
+
+	if (gameOverlay != NULL)
+	{
+		return g_origXInputGetState(dwUserIndex, pState);
+	}
+
 	auto gamepads = Gamepad::Gamepads();
 
 	if (gamepads.Size() == 0 || !g_useWGI)
@@ -1289,6 +1309,14 @@ static DWORD(*WINAPI g_origXInputSetState)(_In_ DWORD dwUserIndex, _In_ XINPUT_V
 
 static DWORD WINAPI XInputSetStateHook(_In_ DWORD dwUserIndex, _In_ XINPUT_VIBRATION* pVibration)
 {
+	// if we're running Steam, don't - Steam will crash in numerous scenarios.
+	static auto gameOverlay = GetModuleHandleW(L"gameoverlayrenderer64.dll");
+
+	if (gameOverlay != NULL)
+	{
+		return g_origXInputSetState(dwUserIndex, pVibration);
+	}
+
 	auto gamepads = Gamepad::Gamepads();
 
 	if (gamepads.Size() == 0 || !g_useWGI)

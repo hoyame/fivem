@@ -27,12 +27,12 @@ namespace rage
 	class STREAMING_EXPORT fwRefAwareBase
 	{
 	public:
-		~fwRefAwareBase() = default;
+		virtual ~fwRefAwareBase() = default;
 
 	public:
-		void AddKnownRef(void** ref) const;
+		void AddKnownRef(void** ref);
 
-		void RemoveKnownRef(void** ref) const;
+		void RemoveKnownRef(void** ref);
 	};
 
 	class STREAMING_EXPORT fwScriptGuid
@@ -159,6 +159,20 @@ public:
 	char m_pad[53];
 	uint8_t miType : 5;
 };
+
+namespace rage
+{
+struct fwModelId
+{
+	uint64_t id;
+};
+
+class STREAMING_EXPORT fwArchetypeManager
+{
+public:
+	static fwArchetype* GetArchetypeFromHashKey(uint32_t hash, fwModelId& id);
+};
+}
 
 namespace rage
 {

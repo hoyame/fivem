@@ -5,8 +5,12 @@ end
 
 -- is game host?
 local function isGamePersonality(name)
-	if _OPTIONS['game'] ~= 'five' and _OPTIONS['game'] ~= 'rdr3' then
+	if _OPTIONS['game'] ~= 'five' and _OPTIONS['game'] ~= 'rdr3' and _OPTIONS['game'] ~= 'ny' then
 		return isLauncherPersonality(name)
+	end
+
+	if name == 'game_mtl' then
+		return true
 	end
 
 	if name == 'game_1604' or name == 'game_2060' or name == 'game_372' or name == 'game_2189' then
@@ -14,6 +18,10 @@ local function isGamePersonality(name)
 	end
 	
 	if name == 'game_1311' or name == 'game_1355' then
+		return true
+	end
+	
+	if name == 'game_43' then
 		return true
 	end
 	
@@ -45,6 +53,8 @@ local function launcherpersonality(name)
 		
 		if isLauncherPersonality(name) then
 			links "Win2D"
+			
+			add_dependencies { 'vendor:minhook-crt' }
 		else
 			targetextension '.bin'
 		end
@@ -66,6 +76,13 @@ local function launcherpersonality(name)
 				if name == 'game_2189' then gameBuild = '2189_0' end
 				if name == 'game_2060' then gameBuild = '2060_2' end
 				if name == 'game_372' then gameBuild = '372' end
+
+				local gameDump = ("C:\\f\\GTA5_%s_dump.exe"):format(gameBuild)
+
+				if name == 'game_mtl' then
+					gameDump = "C:\\f\\Launcher.exe"
+					gameBuild = 'mtl'
+				end
 			
 				postbuildcommands {
 					("if not exist \"%%{cfg.buildtarget.directory}\\msobj140.dll\" ( copy /y \"%s\" \"%%{cfg.buildtarget.directory}\" )"):format(
@@ -74,8 +91,8 @@ local function launcherpersonality(name)
 					("if not exist \"%%{cfg.buildtarget.directory}\\mspdbcore.dll\" ( copy /y \"%s\" \"%%{cfg.buildtarget.directory}\" )"):format(
 						path.getabsolute('../../tools/dbg/bin/mspdbcore.dll'):gsub('/', '\\')
 					),
-					("if exist C:\\f\\GTA5_%s_dump.exe ( %%{cfg.buildtarget.directory}\\retarget_pe \"%%{cfg.buildtarget.abspath}\" C:\\f\\GTA5_%s_dump.exe )"):format(
-						gameBuild, gameBuild
+					("if exist %s ( %%{cfg.buildtarget.directory}\\retarget_pe \"%%{cfg.buildtarget.abspath}\" %s )"):format(
+						gameDump, gameDump
 					),
 					("if exist \"%s\" ( %%{cfg.buildtarget.directory}\\pe_debug \"%%{cfg.buildtarget.abspath}\" \"%s\" )"):format(
 						path.getabsolute(('../../tools/dbg/dump_%s.txt'):format(gameBuild)),
@@ -86,10 +103,17 @@ local function launcherpersonality(name)
 				local gameBuild = '1311'
 				
 				if name == 'game_1355' then gameBuild = '1355_18' end
+
+				local gameDump = ("C:\\f\\RDR2_%s.exe"):format(gameBuild)
+
+				if name == 'game_mtl' then
+					gameDump = "C:\\f\\Launcher.exe"
+					gameBuild = 'mtl'
+				end
 			
 				postbuildcommands {
-					("if exist C:\\f\\RDR2_%s.exe ( %%{cfg.buildtarget.directory}\\retarget_pe \"%%{cfg.buildtarget.abspath}\" C:\\f\\RDR2_%s.exe )"):format(
-						gameBuild, gameBuild
+					("if exist %s ( %%{cfg.buildtarget.directory}\\retarget_pe \"%%{cfg.buildtarget.abspath}\" %s )"):format(
+						gameDump, gameDump
 					),
 				}
 			end
@@ -109,7 +133,7 @@ local function launcherpersonality(name)
 		add_dependencies { 'vendor:breakpad', 'vendor:tinyxml2', 'vendor:xz-crt', 'vendor:minizip-crt', 'vendor:tbb-crt', 'vendor:concurrentqueue', 'vendor:boost_locale-crt' }
 		
 		if isLauncherPersonality(name) then
-			add_dependencies { 'vendor:curl-crt', 'vendor:cpr-crt', 'vendor:mbedtls_crt', 'vendor:openssl_crypto_crt', 'vendor:hdiffpatch' }
+			add_dependencies { 'vendor:curl-crt', 'vendor:cpr-crt', 'vendor:mbedtls_crt', 'vendor:openssl_crypto_crt', 'vendor:hdiffpatch-crt' }
 		end
 		
 		--includedirs { "client/libcef/", "../vendor/breakpad/src/", "../vendor/tinyxml2/" }
@@ -117,7 +141,7 @@ local function launcherpersonality(name)
 		staticruntime 'On'
 
 		filter { "options:game=ny" }
-			targetname "CitizenFX"
+			targetname "LibertyM"
 
 		filter { "options:game=payne" }
 			targetname "CitizenPayne"
@@ -165,9 +189,13 @@ if _OPTIONS['game'] == 'five' then
 	launcherpersonality 'game_372'
 	launcherpersonality 'game_2060'
 	launcherpersonality 'game_2189'
-else
+	launcherpersonality 'game_mtl'
+elseif _OPTIONS['game'] == 'rdr3' then
 	launcherpersonality 'game_1311'
 	launcherpersonality 'game_1355'
+	launcherpersonality 'game_mtl'
+elseif _OPTIONS['game'] == 'ny' then
+	launcherpersonality 'game_43'
 end
 
 externalproject "Win2D"

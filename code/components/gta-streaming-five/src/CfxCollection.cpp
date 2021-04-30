@@ -8,6 +8,7 @@
 #include <StdInc.h>
 #include <fiCollectionWrapper.h>
 
+#include <jitasm.h>
 #include <Hooking.h>
 
 #include <fnv.h>
@@ -1877,6 +1878,11 @@ void origCfxCollection_AddStreamingFileByTag(const std::string& tag, const std::
 
 	g_customStreamingFilesByTag[tag].push_back({ fileName, flags });
 #endif
+}
+
+void origCfxCollection_BackoutStreamingTag(const std::string& tag)
+{
+	g_customStreamingFilesByTag.erase(tag);
 }
 
 /*void ForAllStreamingFiles(const std::function<void(const std::string&)>& cb)

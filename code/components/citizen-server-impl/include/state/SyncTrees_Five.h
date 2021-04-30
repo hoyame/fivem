@@ -1651,6 +1651,35 @@ struct CEntityOrientationDataNode : GenericSerializeDataNode<CEntityOrientationD
 	}
 };
 
+struct CObjectOrientationDataNode : GenericSerializeDataNode<CObjectOrientationDataNode>
+{
+	CObjectOrientationNodeData data;
+
+	template<typename Serializer>
+	bool Serialize(Serializer& s)
+	{
+		s.Serialize(data.highRes);
+
+		if (data.highRes)
+		{
+			const float divisor = glm::pi<float>() * 4;
+
+			s.SerializeSigned(20, divisor, data.rotX);
+			s.SerializeSigned(20, divisor, data.rotY);
+			s.SerializeSigned(20, divisor, data.rotZ);
+		}
+		else
+		{
+			s.Serialize(2, data.quat.largest);
+			s.Serialize(11, data.quat.integer_a);
+			s.Serialize(11, data.quat.integer_b);
+			s.Serialize(11, data.quat.integer_c);
+		}
+
+		return true;
+	}
+};
+
 struct CPhysicalVelocityDataNode
 {
 	CPhysicalVelocityNodeData data;
@@ -1752,7 +1781,7 @@ struct CObjectCreationDataNode
 	// #TODO: universal serializer
 	bool Unparse(SyncUnparseState& state)
 	{
-		state.buffer.Write<int>(5, 1);
+		state.buffer.Write<int>(5, 4); // ENTITY_OWNEDBY_SCRIPT
 		state.buffer.Write<uint32_t>(32, m_model);
 		state.buffer.WriteBit(m_dynamic);
 		state.buffer.WriteBit(false);
@@ -1770,6 +1799,26 @@ struct CObjectCreationDataNode
 		/*
 			Probably a subsystem ID
 			If it's 0 or 2, it's a dummy object
+
+			Enum from X360:
+			0: ENTITY_OWNEDBY_RANDOM
+			1: ENTITY_OWNEDBY_TEMP
+			2: ENTITY_OWNEDBY_FRAGMENT_CACHE
+			3: ENTITY_OWNEDBY_GAME
+			4: ENTITY_OWNEDBY_SCRIPT
+			5: ENTITY_OWNEDBY_AUDIO
+			6: ENTITY_OWNEDBY_CUTSCENE
+			7: ENTITY_OWNEDBY_DEBUG
+			8: ENTITY_OWNEDBY_OTHER
+			9: ENTITY_OWNEDBY_PROCEDURAL
+			10: ENTITY_OWNEDBY_POPULATION
+			11: ENTITY_OWNEDBY_STATICBOUNDS
+			12: ENTITY_OWNEDBY_PHYSICS
+			13: ENTITY_OWNEDBY_IPL
+			14: ENTITY_OWNEDBY_VFX
+			15: ENTITY_OWNEDBY_NAVMESHEXPORTER
+			16: ENTITY_OWNEDBY_INTERIOR
+			17: ENTITY_OWNEDBY_COMPENTITY
 		*/
 		int createdBy = state.buffer.Read<int>(5);
 		if (createdBy != 0 && createdBy != 2)
@@ -1920,8 +1969,8 @@ struct CPedHealthDataNode
 		if (!isFine)
 		{
 			int pedHealth = state.buffer.Read<int>(13);
-			auto unk4 = state.buffer.ReadBit();
-			auto unk5 = state.buffer.ReadBit();
+			auto killedWithHeadshot = state.buffer.ReadBit();
+			auto killedWithMelee = state.buffer.ReadBit();
 
 			data.health = pedHealth;
 		}
@@ -1959,12 +2008,16 @@ struct CPedHealthDataNode
 		}
 
 
-		auto unk8 = state.buffer.ReadBit();
+		auto hasSource = state.buffer.ReadBit();
 
-		if (unk8) // unk9 != 0
+		if (hasSource)
 		{
-			// object ID
-			auto unk9 = state.buffer.Read<short>(13);
+			int damageEntity = state.buffer.Read<int>(13);
+			data.sourceOfDamage = damageEntity;
+		}
+		else 
+		{
+			data.sourceOfDamage = 0;
 		}
 
 		int causeOfDeath = state.buffer.Read<int>(32);
@@ -2116,7 +2169,8 @@ struct CTrainGameStateDataNode
 
 struct CPlayerCreationDataNode { bool Parse(SyncParseState& state) { return true; } };
 
-struct CPlayerGameStateDataNode {
+struct CPlayerGameStateDataNode
+{
 	CPlayerGameStateNodeData data;
 
 	bool Parse(SyncParseState& state)
@@ -2169,11 +2223,6 @@ struct CPlayerGameStateDataNode {
 		auto steamProof = state.buffer.ReadBit();
 		auto unk21 = state.buffer.ReadBit();
 		auto unk22 = state.buffer.ReadBit();
-
-		if (Is2060())
-		{
-			state.buffer.ReadBit();
-		}
 
 		if (unk12)
 		{
@@ -2267,9 +2316,18 @@ struct CPlayerGameStateDataNode {
 		auto unk67 = state.buffer.ReadBit();
 		auto unk68 = state.buffer.ReadBit();
 		auto unk69 = state.buffer.ReadBit();
-		auto unk70 = state.buffer.ReadBit();
 
-		// #TODO2060: maybe extra read near here? list is weird
+		if (Is2060())
+		{
+			state.buffer.ReadBit();
+		}
+
+		if (Is2189())
+		{
+			state.buffer.ReadBit();
+		}
+
+		auto unk70 = state.buffer.ReadBit();
 
 		if (unk70)
 		{
@@ -2842,6 +2900,13 @@ struct SyncTree : public SyncTreeBase
 		return (hasNode) ? &node->data : nullptr;
 	}
 
+	virtual CObjectOrientationNodeData* GetObjectOrientation() override
+	{
+		auto [hasNode, node] = GetData<CObjectOrientationDataNode>();
+
+		return (hasNode) ? &node->data : nullptr;
+	}
+
 	virtual CVehicleAngVelocityNodeData* GetAngVelocity() override
 	{
 		{
@@ -2942,7 +3007,20 @@ struct SyncTree : public SyncTreeBase
 
 		return false;
 	}
-		
+
+	virtual bool IsEntityVisible(bool* visible)
+	{
+		auto [hasNode, node] = GetData<CPhysicalGameStateDataNode>();
+
+		if (hasNode)
+		{
+			*visible = node->isVisible;
+			return true;
+		}
+
+		return false;
+	}
+
 	virtual void Parse(SyncParseState& state) final override
 	{
 		std::unique_lock<std::mutex> lock(mutex);
@@ -3267,7 +3345,7 @@ using CObjectSyncTree = SyncTree<
 			NodeIds<87, 87, 0>, 
 			NodeWrapper<NodeIds<87, 87, 0>, CSectorDataNode>, 
 			NodeWrapper<NodeIds<87, 87, 0>, CObjectSectorPosNode>, 
-			NodeWrapper<NodeIds<87, 87, 0>, CEntityOrientationDataNode>, 
+			NodeWrapper<NodeIds<87, 87, 0>, CObjectOrientationDataNode>, 
 			NodeWrapper<NodeIds<87, 87, 0>, CPhysicalVelocityDataNode>, 
 			NodeWrapper<NodeIds<87, 87, 0>, CPhysicalAngVelocityDataNode>
 		>, 
